@@ -72,21 +72,21 @@ else
   ADMIN_PASS="admin123"
 fi
 
-# Get public IP with better services
-echo -e "${YELLOW}Detecting server IP...${NC}"
+# Get public IP with better services, force IPv4
+echo -e "${YELLOW}Detecting server IP (IPv4)...${NC}"
 apt install -y curl > /dev/null 2>&1
-IP=$(curl -s icanhazip.com)
+IP=$(curl -4 -s icanhazip.com)
 if [ -z "$IP" ] || echo "$IP" | grep -q '<'; then
-  IP=$(curl -s ipinfo.io/ip)
+  IP=$(curl -4 -s ipinfo.io/ip)
 fi
 if [ -z "$IP" ] || echo "$IP" | grep -q '<'; then
-  IP=$(curl -s ifconfig.co)
+  IP=$(curl -4 -s ifconfig.co)
 fi
 if [ -z "$IP" ] || echo "$IP" | grep -q '<'; then
   IP=$(hostname -I | awk '{print $1}')
   echo -e "${RED}Could not detect public IP, using local IP: $IP${NC}"
 else
-  echo -e "${GREEN}Public IP detected: $IP${NC}"
+  echo -e "${GREEN}Public IPv4 detected: $IP${NC}"
 fi
 
 simulate_progress 0 10
@@ -141,7 +141,7 @@ def get_db():
 
 # Initialize DB and migrate
 conn = get_db()
-conn.execute('CREATE TABLE IF NOT EXISTS users (uid INTEGER PRIMARY KEY, username TEXT, limit_bytes INTEGER DEFAULT 0, expiration_date TEXT, active INTEGER DEFAULT 1)')
+conn.execute('CREATE TABLE IF NOT EXISTS users (uid INTEGER PRIMARY KEY, username TEXT, limit_bytes INTEGER DEFAULT 0, expiration_date TEXT, active INTEGER DEFAULT 1, connection_limit INTEGER DEFAULT 1)')
 conn.execute('CREATE TABLE IF NOT EXISTS usage (date TEXT, uid INTEGER, bytes_out INTEGER, PRIMARY KEY (date, uid))')
 try:
     conn.execute('ALTER TABLE usage ADD COLUMN bytes_in INTEGER')
@@ -157,6 +157,10 @@ except sqlite3.OperationalError:
     pass
 try:
     conn.execute('ALTER TABLE users ADD COLUMN active INTEGER DEFAULT 1')
+except sqlite3.OperationalError:
+    pass
+try:
+    conn.execute('ALTER TABLE users ADD COLUMN connection_limit INTEGER DEFAULT 1')
 except sqlite3.OperationalError:
     pass
 conn.commit()
@@ -325,6 +329,7 @@ def add_user():
         password = request.form['password']
         limit_mb = int(request.form.get('limit_mb', 0)) * 1024 * 1024  # Convert MB to bytes
         expiration_days = int(request.form.get('expiration_days', 0))
+        connection_limit = 1  # Default to 1 as per request
         expiration_date = None
         if expiration_days > 0:
             expiration_date = (datetime.now() + timedelta(days=expiration_days)).strftime('%Y-%m-%d')
@@ -336,9 +341,19 @@ def add_user():
             subprocess.check_call(f"echo '{username}:{password}' | chpasswd", shell=True)
             conn = get_db()
             uid = int(subprocess.check_output(f"id -u {username}", shell=True).decode().strip())
-            conn.execute('INSERT INTO users (uid, username, limit_bytes, expiration_date) VALUES (?, ?, ?, ?)', (uid, username, limit_mb, expiration_date))
+            conn.execute('INSERT INTO users (uid, username, limit_bytes, expiration_date, connection_limit) VALUES (?, ?, ?, ?, ?)', (uid, username, limit_mb, expiration_date, connection_limit))
+            conn.commit()
+            # Clear any existing usage for new user
+            conn.execute('DELETE FROM usage WHERE uid = ?', (uid,))
             conn.commit()
             conn.close()
+            # Reset iptables chains for new user
+            out_chain="USER_OUT_${uid}"
+            in_chain="USER_IN_${uid}"
+            subprocess.call(f"iptables -F {out_chain} 2>/dev/null", shell=True)
+            subprocess.call(f"iptables -Z {out_chain} 2>/dev/null", shell=True)
+            subprocess.call(f"iptables -F {in_chain} 2>/dev/null", shell=True)
+            subprocess.call(f"iptables -Z {in_chain} 2>/dev/null", shell=True)
             flash('یوزر جدید با موفقیت اضافه شد.')
             update_users()  # Update DB
             ensure_chains()  # Ensure iptables chains
@@ -351,28 +366,31 @@ def add_user():
 @login_required
 def edit_user(username):
     conn = get_db()
-    cursor = conn.execute('SELECT limit_bytes, expiration_date FROM users WHERE username = ?', (username,))
+    cursor = conn.execute('SELECT limit_bytes, expiration_date, connection_limit FROM users WHERE username = ?', (username,))
     row = cursor.fetchone()
     conn.close()
     if row:
         current_limit_mb = row['limit_bytes'] // (1024 * 1024) if row['limit_bytes'] else 0
         current_expiration = row['expiration_date']
+        current_connection_limit = row['connection_limit']
     else:
         current_limit_mb = 0
         current_expiration = None
+        current_connection_limit = 1
     if request.method == 'POST':
         limit_mb = int(request.form.get('limit_mb', 0)) * 1024 * 1024
         expiration_days = int(request.form.get('expiration_days', 0))
+        connection_limit = int(request.form.get('connection_limit', 1))
         expiration_date = None
         if expiration_days > 0:
             expiration_date = (datetime.now() + timedelta(days=expiration_days)).strftime('%Y-%m-%d')
         conn = get_db()
-        conn.execute('UPDATE users SET limit_bytes = ?, expiration_date = ? WHERE username = ?', (limit_mb, expiration_date, username))
+        conn.execute('UPDATE users SET limit_bytes = ?, expiration_date = ?, connection_limit = ? WHERE username = ?', (limit_mb, expiration_date, connection_limit, username))
         conn.commit()
         conn.close()
         flash('یوزر با موفقیت ویرایش شد.')
         return redirect(url_for('dashboard'))
-    return render_template('edit_user.html', username=username, current_limit_mb=current_limit_mb, current_expiration=current_expiration)
+    return render_template('edit_user.html', username=username, current_limit_mb=current_limit_mb, current_expiration=current_expiration, current_connection_limit=current_connection_limit)
 
 @app.route('/delete_user/<username>', methods=['GET'])
 @login_required
@@ -635,6 +653,10 @@ cat > templates/edit_user.html <<EOF
                         <label for="expiration_days">انقضا (روز از امروز، 0 برای نامحدود)</label>
                         <input type="number" class="form-control" id="expiration_days" name="expiration_days" value="0" min="0" required>
                     </div>
+                    <div class="form-group">
+                        <label for="connection_limit">محدودیت اتصال همزمان (1 برای یک دستگاه)</label>
+                        <input type="number" class="form-control" id="connection_limit" name="connection_limit" value="{{ current_connection_limit }}" min="1" required>
+                    </div>
                     <button type="submit" class="btn btn-primary btn-block">به‌روزرسانی <i class="fas fa-sync"></i></button>
                 </form>
                 <a href="{{ url_for('dashboard') }}" class="btn btn-secondary btn-block mt-3">بازگشت به داشبورد</a>
@@ -884,9 +906,32 @@ cat > templates/dashboard.html <<EOF
                 min-width: 60px;
             }
         }
+
+        /* Version badge */
+        .version-badge {
+            position: absolute;
+            top: 10px;
+            left: 10px;
+            background-color: rgba(255, 255, 255, 0.2);
+            color: #fff;
+            padding: 5px 10px;
+            border-radius: 50px;
+            font-size: 14px;
+            font-weight: bold;
+            z-index: 1000;
+        }
+        .dark .version-badge {
+            background-color: rgba(255, 255, 255, 0.1);
+            color: #fff;
+        }
+        .light .version-badge {
+            background-color: rgba(0, 0, 0, 0.1);
+            color: #000;
+        }
     </style>
 </head>
 <body class="{{ theme }}">
+    <div class="version-badge">ورژن 1.1</div>
     <nav class="navbar navbar-expand-lg navbar-dark">
         <a class="navbar-brand" href="#"><i class="fas fa-shield-virus"></i> GUARD VPN</a>
         <button class="navbar-toggler" type="button" data-toggle="collapse" data-target="#navbarNav" aria-controls="navbarNav" aria-expanded="false" aria-label="Toggle navigation">
@@ -1173,7 +1218,61 @@ conn.close()
 PYEOF
 EOF
 chmod +x /etc/cron.daily/save_traffic
-simulate_progress 90 95
+simulate_progress 90 92
+
+echo -e "${YELLOW}Setting up PAM for IP limit...${NC}"
+cat > /usr/local/bin/check_ip.sh <<EOF
+#!/bin/bash
+USER=\$PAM_USER
+IP=\$PAM_RHOST
+FILE=/var/run/ssh-ip/\${USER}.ip
+mkdir -p /var/run/ssh-ip
+if [ -f "\$FILE" ]; then
+  STORED_IP=\$(cat "\$FILE")
+  if [ "\$IP" != "\$STORED_IP" ]; then
+    exit 1  # deny login
+  fi
+else
+  echo "\$IP" > "\$FILE"
+fi
+exit 0
+EOF
+chmod +x /usr/local/bin/check_ip.sh
+
+# Add to /etc/pam.d/sshd
+echo "auth required pam_exec.so /usr/local/bin/check_ip.sh" >> /etc/pam.d/sshd
+
+simulate_progress 92 93
+
+echo -e "${YELLOW}Setting up cron to clean IP files...${NC}"
+cat > /opt/traffic_panel/clean_ip_files.py <<EOF
+import sqlite3
+import subprocess
+import os
+
+conn = sqlite3.connect('traffic.db')
+cursor = conn.execute('SELECT username FROM users')
+for row in cursor:
+    username = row[0]
+    file = f"/var/run/ssh-ip/{username}.ip"
+    try:
+        output = subprocess.check_output(f"ps -u {username} -o pid,comm --no-headers | grep sshd | wc -l", shell=True).decode().strip()
+        count = int(output)
+        if count == 0 and os.path.exists(file):
+            os.remove(file)
+    except:
+        pass
+conn.close()
+EOF
+
+cat > /etc/cron.d/clean_ip_files <<EOF
+*/1 * * * * root cd /opt/traffic_panel && python3 clean_ip_files.py
+EOF
+simulate_progress 93 95
+
+echo -e "${YELLOW}Restarting SSH service...${NC}"
+systemctl restart sshd
+simulate_progress 95 96
 
 echo -e "${YELLOW}Creating systemd service for the panel...${NC}"
 cat > /etc/systemd/system/traffic_panel.service <<EOF
@@ -1195,7 +1294,7 @@ systemctl daemon-reload
 systemctl stop traffic_panel 2>/dev/null || true
 systemctl start traffic_panel
 systemctl enable traffic_panel
-simulate_progress 95 100
+simulate_progress 96 100
 
 echo -e "${BLUE}==========================================${NC}"
 echo -e "${GREEN}Installation complete!${NC}"
@@ -1214,6 +1313,10 @@ echo -e "${GREEN}✓ Online status based on running processes${NC}"
 echo -e "${GREEN}✓ Professional design with dark/light themes${NC}"
 echo -e "${GREEN}✓ System monitoring gauges${NC}"
 echo -e "${GREEN}✓ User management with limits and expiration${NC}"
+echo -e "${GREEN}✓ Limited to one IP per user using PAM and cron cleanup${NC}"
+echo -e "${GREEN}✓ Fixed initial traffic for new users to 0 by clearing usage and resetting chains${NC}"
+echo -e "${GREEN}✓ Added version badge 'ورژن 1.1' in top-left corner${NC}"
+echo -e "${GREEN}✓ Forced IPv4 detection in installation script${NC}"
 
 echo -e "${GREEN}"
 figlet "GUARDNET VPN"
