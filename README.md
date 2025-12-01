@@ -2,7 +2,7 @@
 
 ## Advanced VPN User Management & Monitoring System
 
-![Version](https://img.shields.io/badge/version-2.0.0-brightgreen.svg)
+![Version](https://img.shields.io/badge/version-1.1.0-brightgreen.svg)
 ![Python](https://img.shields.io/badge/python-3.6+-blue.svg)
 ![License](https://img.shields.io/badge/license-MIT-green.svg)
 ![Platform](https://img.shields.io/badge/platform-Ubuntu-lightgrey.svg)
